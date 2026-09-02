@@ -1,0 +1,265 @@
+# drops the first x points of each block for a smoother graph
+# measures 2500 points in about 35.5 seconds, so the min time between points is about 14-15ms
+# for times less than 35.5 seconds, adjust burst_N accordingly
+
+import pyvisa
+import time
+import csv
+import os
+from datetime import datetime
+import re
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+GPIB_ADDR = "GPIB0::24::INSTR"
+
+SAVE_DIR = r"D:\school\Lab work\iv figures\excel_feb_26"
+FIG_DIR  = r"D:\school\Lab work\iv figures\IV_figs_feb_26"
+
+DROP_N = 50  # remove first N points from each burst in saved/plot data
+
+# ==============================
+# Helper: make a Windows-safe filename chunk
+# ==============================
+def sanitize_for_filename(s: str, max_len: int = 60) -> str:
+    s = s.strip()
+    if not s:
+        return "untitled"
+    s = re.sub(r'[\\/:*?"<>|]+', "_", s)  # illegal filename chars -> _
+    s = re.sub(r"\s+", "_", s)            # whitespace -> _
+    s = s[:max_len].strip("_")            # keep it short
+    return s if s else "untitled"
+
+def drain_errors(inst, tag=""):
+    while True:
+        e = inst.query(":SYST:ERR?").strip()
+        print(f"[{tag}] ERR? {e}")
+        if e.startswith("0,"):
+            break
+
+def parse_ascii(data_str):
+    return [float(x) for x in data_str.strip().split(",") if x.strip() != ""]
+
+def main():
+    Title         = str(input("Enter title (sample name, date, etc): ")).strip()
+    V_set         = float(input("Voltage to apply (V): "))
+    total_seconds = float(input("Total time (seconds): "))
+    comp_limit    = float(input("Current compliance (A), e.g. 1e-7: "))
+    curr_range    = float(input("Fixed current range (A), e.g. 1e-12: "))
+    nplc          = float(input("NPLC (min 0.01): "))
+    burst_N       = int(float(input("Trace points per burst N (max 2500): ")))
+
+    if burst_N <= 0:
+        raise ValueError("burst_N must be > 0")
+    if DROP_N < 0:
+        raise ValueError("DROP_N must be >= 0")
+    if DROP_N >= burst_N:
+        raise ValueError(f"DROP_N ({DROP_N}) must be < burst_N ({burst_N})")
+
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(FIG_DIR,  exist_ok=True)
+
+    run_tag   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    V_tag     = f"{V_set:.3f}".replace(".", "p")
+    T_tag     = f"{int(total_seconds)}s"
+    Title_tag = sanitize_for_filename(Title)
+
+    base_name = f"{Title_tag}_hold_trace_loop_{V_tag}_{T_tag}_drop{DROP_N}_N{burst_N}_{run_tag}"
+
+    csv_path  = os.path.join(SAVE_DIR, base_name + ".csv")
+    xlsx_path = os.path.join(SAVE_DIR, base_name + ".xlsx")
+    fig_path  = os.path.join(FIG_DIR,  base_name + ".png")
+
+    rm = pyvisa.ResourceManager()
+    inst = rm.open_resource(GPIB_ADDR)
+    inst.write_termination = "\n"
+    inst.read_termination  = "\n"
+    inst.timeout = 60000
+
+    print("IDN:", inst.query("*IDN?").strip())
+
+    # -----------------------------
+    # Reset / basic config
+    # -----------------------------
+    inst.write("*RST")
+    inst.write(":ABOR")
+    inst.write("*CLS")
+    drain_errors(inst, "reset")
+
+    inst.write(":OUTP ON")
+
+    inst.write(":SOUR:FUNC VOLT")
+    inst.write(f":SOUR:VOLT {V_set}")
+
+    inst.write(":SENS:FUNC 'CURR:DC'")
+    inst.write(f":SENS:CURR:PROT {comp_limit}")
+    inst.write(f":SENS:CURR:NPLC {nplc}")
+
+    # NOTE: original code uses RANG (not RANGE). Keeping your original commands unchanged.
+    inst.write(":SENS:CURR:RANG:AUTO OFF")
+    inst.write(f":SENS:CURR:RANG {curr_range}")
+
+    inst.write(":FORM:DATA ASC")
+    inst.write(":FORM:ELEM CURR")
+    drain_errors(inst, "setup")
+
+    # -----------------------------
+    # Loop bursts
+    # -----------------------------
+    t0 = time.monotonic()
+    t_start_iso = datetime.now().isoformat(timespec="seconds")
+
+    burst_idx = 0
+    total_kept_pts = 0
+
+    # Arrays for plotting
+    all_times = []
+    all_currs = []
+
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+
+        # CSV header includes Title + run metadata fields
+        w.writerow([
+            "Title",
+            "index",
+            "burst",
+            "elapsed_s_est",
+            "current_A",
+            "V_set_V",
+            "total_s",
+            "NPLC",
+            "fixed_range_A",
+            "DROP_N",
+            "burst_N",
+            "timestamp_iso"
+        ])
+
+        while True:
+            elapsed = time.monotonic() - t0
+            if elapsed >= total_seconds:
+                break
+
+            burst_idx += 1
+
+            # Configure trace for this burst (UNCHANGED)
+            inst.write(":ABOR")
+            inst.write(":TRAC:FEED:CONT NEV")
+            inst.write(":TRAC:CLE")
+            inst.write(f":TRAC:POIN {burst_N}")
+            inst.write(":TRAC:FEED SENS")
+            inst.write(":TRAC:FEED:CONT NEXT")
+
+            inst.write(f":TRIG:COUN {burst_N}")
+            inst.write(":TRIG:SOUR IMM")
+            inst.write(":ARM:SOUR IMM")
+            inst.write(":ARM:COUN 1")
+
+            drain_errors(inst, f"cfg_b{burst_idx}")
+
+            # Acquire (UNCHANGED)
+            t_b0 = time.monotonic()
+            inst.write(":INIT")
+            inst.timeout = 180000
+            inst.query("*OPC?")
+            t_b1 = time.monotonic()
+
+            # Read trace (UNCHANGED)
+            data = inst.query(":TRAC:DATA?")
+            vals = parse_ascii(data)
+            raw_len = len(vals)
+
+            # Drop first DROP_N points for saved/plot data
+            kept_vals = vals[DROP_N:] if raw_len > DROP_N else []
+
+            # Timebase built from wall-time for this burst.
+            # dt computed from RAW burst length, then apply the drop by offsetting start time.
+            burst_wall = t_b1 - t_b0
+            dt = burst_wall / max(raw_len - 1, 1)
+
+            t_start_raw  = t_b0 - t0
+            t_start_kept = t_start_raw + DROP_N * dt
+
+            for i, I in enumerate(kept_vals):
+                total_kept_pts += 1
+                t_est = t_start_kept + i * dt
+                all_times.append(t_est)
+                all_currs.append(I)
+
+                w.writerow([
+                    Title,
+                    total_kept_pts,
+                    burst_idx,
+                    f"{t_est:.6f}",
+                    f"{I:.12e}",
+                    f"{V_set:.6f}",
+                    f"{total_seconds:.6f}",
+                    f"{nplc:.6g}",
+                    f"{curr_range:.6e}",
+                    DROP_N,
+                    burst_N,
+                    t_start_iso
+                ])
+
+            f.flush()
+            print(
+                f"Burst {burst_idx}: raw={raw_len} pts, kept={len(kept_vals)} pts "
+                f"(dropped first {min(DROP_N, raw_len)}), wall={burst_wall:.3f}s"
+            )
+
+    # -----------------------------
+    # Cleanup instrument
+    # -----------------------------
+    inst.write(":SOUR:VOLT 0")
+    time.sleep(0.1)
+    inst.write(":OUTP OFF")
+
+    inst.close()
+    rm.close()
+
+    # -----------------------------
+    # Save XLSX with metadata on first lines
+    # -----------------------------
+    df = pd.read_csv(csv_path)
+
+    meta = pd.DataFrame({
+        "field": [
+            "Title", "V_set_V", "total_s", "NPLC", "fixed_range_A",
+            "DROP_N", "burst_N", "timestamp_iso", "total_kept_points"
+        ],
+        "value": [
+            Title, V_set, total_seconds, nplc, curr_range,
+            DROP_N, burst_N, t_start_iso, total_kept_pts
+        ]
+    })
+
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        meta.to_excel(writer, index=False, sheet_name="data", startrow=0)
+        df.to_excel(writer, index=False, sheet_name="data", startrow=3)
+
+    # -----------------------------
+    # Plot + autosave FIG
+    # -----------------------------
+    plt.figure(figsize=(10, 6))
+    plt.plot(all_times, all_currs, "o-", markersize=2)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Current (A)")
+    plt.title(
+        f"{Title}\n"
+        f"6430 Looping Bursts (drop first {DROP_N}/burst) | {total_kept_pts} kept pts | "
+        f"V={V_set} V | NPLC={nplc} | range={curr_range:.3e} A | burst_N={burst_N}"
+    )
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+
+    print(f"\nSaved FIG:  {fig_path}")
+    print(f"Saved CSV:  {csv_path}")
+    print(f"Saved XLSX: {xlsx_path}")
+    print(f"Total kept points: {total_kept_pts}")
+
+    plt.show()
+
+if __name__ == "__main__":
+    main()
